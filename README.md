@@ -438,3 +438,190 @@ Planned improvements:
 * Safety stock logic
 * Order status classification
 * Dashboard-style Excel formatting
+
+## Update: Weekly Supply View
+
+This project has been updated to include a new Excel sheet named:
+
+```text
+weekly_supply_view
+```
+
+The purpose of this sheet is to provide a horizontal 12-week supply view by material.
+
+While the existing `material_supply_plan` sheet summarizes material-level shortage, excess, MOQ recommendation, and supplier risk, the new `weekly_supply_view` sheet helps users identify **when shortages occur by week**.
+
+---
+
+## weekly_supply_view Structure
+
+The `weekly_supply_view` sheet displays each material in a 3-row structure:
+
+| Row Type | Description                                                                |
+| -------- | -------------------------------------------------------------------------- |
+| `생산계획`   | Weekly material requirement calculated from production plan and BOM        |
+| `입고계획`   | Weekly incoming quantity calculated from open purchase orders based on ETA |
+| `과부족 계산` | Rolling shortage/excess calculation by week                                |
+
+Each material is displayed as follows:
+
+```text
+material_code | material_name | supplier | lead_time_days | current_stock | 구분 | W27 | W28 | W29 | ... | W38
+```
+
+The week columns are automatically generated from the earliest `production_plan.plan_week` value and continue for 12 weeks.
+
+For example, if the first production week is `2026-W27`, the sheet creates 12 weekly columns from `W27` to `W38`.
+
+---
+
+## Weekly Calculation Logic
+
+### 1. Weekly Production Requirement
+
+The production plan is merged with the BOM master using `product_code`.
+
+```python
+required_qty = qty * usage_qty
+```
+
+The result is aggregated by:
+
+```text
+material_code
+material_name
+week_start_date
+```
+
+This value is shown in the `생산계획` row.
+
+---
+
+### 2. Weekly Incoming Plan
+
+Open purchase orders are converted into weekly buckets using `eta_date`.
+
+```text
+incoming_qty = sum(open_qty by material_code and eta_week)
+```
+
+This value is shown in the `입고계획` row.
+
+If there is no incoming purchase order for a specific material and week, the value is displayed as `0`.
+
+---
+
+### 3. Rolling Shortage / Excess Calculation
+
+The `과부족 계산` row uses a rolling weekly calculation.
+
+A positive value means shortage.
+A negative value means available surplus.
+Zero means supply and demand are balanced.
+
+First week calculation:
+
+```text
+First week shortage = Production requirement - Current stock - Incoming quantity
+```
+
+From the second week onward:
+
+```text
+Current week shortage = Previous week shortage + Current week production requirement - Current week incoming quantity
+```
+
+Excel formulas are inserted directly into the `과부족 계산` row.
+
+Example:
+
+```excel
+=G2-$E2-G3
+=G4+H2-H3
+=H4+I2-I3
+```
+
+This allows users to review and modify the weekly shortage calculation directly in Excel.
+
+---
+
+## weekly_supply_view Formatting
+
+The `weekly_supply_view` sheet includes Excel formatting for better readability.
+
+Applied formatting:
+
+* Header filter
+* Freeze top row
+* Weekly column width adjustment
+* Number format with thousand separators
+* Background colors by row type
+* Bold font for `과부족 계산` rows
+* Thin separator lines between each material group
+* Conditional formatting only on `과부족 계산` rows
+
+Conditional formatting rule:
+
+| Condition      | Meaning         | Format                           |
+| -------------- | --------------- | -------------------------------- |
+| Cell value > 0 | Shortage occurs | Red background and dark red font |
+
+The red shortage highlight is applied only to the weekly columns in the `과부족 계산` rows.
+It is not applied to `생산계획` or `입고계획` rows.
+
+---
+
+## Updated Output Sheets
+
+The final Excel output now includes four sheets:
+
+| Sheet Name             | Description                                |
+| ---------------------- | ------------------------------------------ |
+| `material_supply_plan` | Main material-level supply planning report |
+| `summary_by_risk`      | Risk-level summary                         |
+| `summary_by_supplier`  | Supplier-level shortage and risk summary   |
+| `weekly_supply_view`   | 12-week horizontal supply view by material |
+
+---
+
+## Updated Validation Logic
+
+The script now validates the `weekly_supply_view` sheet as well.
+
+Validation includes:
+
+* Checks whether `weekly_supply_view` is created
+* Checks whether exactly 12 weekly columns are generated
+* Checks whether each material has exactly 3 rows
+* Validates first week shortage calculation
+* Validates rolling shortage calculation from the second week onward
+* Summarizes materials and weeks where shortage occurs
+
+The script also prints the following summary after execution:
+
+```text
+weekly_supply_view 생성 완료 여부
+전체 자재 수
+전체 주차 수
+부족 발생 자재 수
+부족 발생 주차 수
+가장 먼저 부족이 발생한 주차
+최대 부족수량이 발생한 자재
+최대 부족수량
+```
+
+---
+
+## Updated Project Outcome
+
+This update improves the project from a material-level shortage summary report into a more practical weekly supply planning tool.
+
+The new `weekly_supply_view` helps procurement and SCM users identify:
+
+* Which material will be short
+* In which week the shortage will occur
+* How incoming purchase orders affect weekly supply
+* How current stock is consumed across future weeks
+* Which material should be prioritized for follow-up
+
+This makes the output more useful for purchase order planning, supplier follow-up, and weekly shortage review.
