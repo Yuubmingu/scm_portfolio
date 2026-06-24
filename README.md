@@ -400,35 +400,41 @@ It can be summarized as:
 
 The script was tested in a Kaggle Notebook environment with anonymized sample data.
 
+## Sample Run Result
+
+The script was tested in a Kaggle Notebook environment with anonymized sample data.
+
 Sample execution result:
 
-| Metric | Result |
-|---|---:|
-| Output rows | 50 |
-| Unique materials | 20 |
-| High risk items | 14 |
-| Medium risk items | 8 |
-| Total shortage quantity | 7,120 |
-| Total shortage amount | 36,905,000 |
-| Total excess quantity | 14,020 |
-| Total excess amount | 41,400,000 |
-| Total recommended order quantity | 8,550 |
-| Total recommended order amount | 46,700,000 |
+| Metric                           |     Result |
+| -------------------------------- | ---------: |
+| Output rows                      |         50 |
+| Unique materials                 |         20 |
+| High risk items                  |         14 |
+| Medium risk items                |          8 |
+| Total shortage quantity          |      7,120 |
+| Total shortage amount            | 36,905,000 |
+| Total excess quantity            |     14,020 |
+| Total excess amount              | 41,400,000 |
+| Total recommended order quantity |      8,550 |
+| Total recommended order amount   | 46,700,000 |
 
 The output Excel file was successfully generated at:
 
 ```text
 /kaggle/working/material_supply_plan.xlsx
+```
 
 ## Limitations and Next Steps
 
-This version calculates shortage and excess by planning week using current stock and incoming purchase orders.  
-It does not yet perform rolling inventory deduction across weeks.
+This version calculates shortage and excess by planning week using current stock and incoming purchase orders.
+
+It does not yet perform rolling inventory deduction across weeks. In other words, current stock is not automatically carried forward and deducted from one planning week to the next.
 
 Planned improvements:
 
-- Rolling inventory calculation by week
-- ETA-based incoming quantity by required date
-- Safety stock logic
-- Order status classification
-- Dashboard-style Excel formatting
+* Rolling inventory calculation by week
+* ETA-based incoming quantity by required date
+* Safety stock logic
+* Order status classification
+* Dashboard-style Excel formatting
