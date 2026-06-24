@@ -3,6 +3,7 @@ import numpy as np
 import re
 from pathlib import Path
 
+
 # =========================================================
 # 0. 기본 경로 설정
 # =========================================================
@@ -96,15 +97,12 @@ def parse_iso_week(plan_week_value):
 
     value = str(plan_week_value).strip()
 
-    # 2026-W27 또는 2026W27 형식 처리
     match = re.match(r"^(\d{4})-?W(\d{1,2})$", value)
 
     if match:
         year = int(match.group(1))
         week = int(match.group(2))
 
-        # ISO 주차 기준
-        # 월요일 = 1, 일요일 = 7
         week_start_date = pd.to_datetime(
             f"{year}-W{week:02d}-1",
             format="%G-W%V-%u",
@@ -135,18 +133,18 @@ def parse_iso_week(plan_week_value):
             "month_end_date": month_end_date
         })
 
-    # 일반 날짜 형식 처리
     parsed_date = pd.to_datetime(value, errors="coerce")
 
     if not pd.isna(parsed_date):
+        week_start_date = parsed_date - pd.to_timedelta(parsed_date.weekday(), unit="D")
+
         return pd.Series({
-            "week_start_date": parsed_date,
+            "week_start_date": week_start_date,
             "required_date": parsed_date,
             "plan_month": parsed_date.strftime("%Y-%m"),
             "month_end_date": parsed_date + pd.offsets.MonthEnd(0)
         })
 
-    # 변환 실패 시 안전 처리
     return pd.Series({
         "week_start_date": pd.NaT,
         "required_date": pd.NaT,
@@ -175,53 +173,30 @@ def calculate_recommended_order_qty(shortage_qty, moq):
 
 def adjust_excel_column_width(writer, sheet_name, df):
     """
-    openpyxl을 사용해 엑셀 컬럼 너비와 표시 형식을 조정하는 함수
+    기존 3개 시트 공통 서식 적용 함수
 
     적용 내용:
     1. 모든 컬럼 너비 자동 조정
-    2. 컬럼명에 amount가 들어간 컬럼은 1,000 형식 적용
-    3. 컬럼명에 date가 들어간 컬럼은 yyyy-mm-dd 날짜 형식 적용
-    4. risk_level 컬럼 값에 따라 배경색 적용
-       - High: 빨간색
-       - Medium: 노란색
-       - Low: 초록색
+    2. amount 컬럼은 1,000 형식 적용
+    3. date 컬럼은 yyyy-mm-dd 형식 적용
+    4. risk_level 컬럼은 High / Medium / Low별 색상 적용
     """
 
     from openpyxl.styles import PatternFill, Font, Alignment
 
     worksheet = writer.sheets[sheet_name]
 
-    # risk_level 색상 정의
-    high_fill = PatternFill(
-        fill_type="solid",
-        fgColor="FFC7CE"  # 연한 빨강
-    )
+    high_fill = PatternFill(fill_type="solid", fgColor="FFC7CE")
+    medium_fill = PatternFill(fill_type="solid", fgColor="FFEB9C")
+    low_fill = PatternFill(fill_type="solid", fgColor="C6EFCE")
+    normal_fill = PatternFill(fill_type="solid", fgColor="FFFFFF")
 
-    medium_fill = PatternFill(
-        fill_type="solid",
-        fgColor="FFEB9C"  # 연한 노랑
-    )
-
-    low_fill = PatternFill(
-        fill_type="solid",
-        fgColor="C6EFCE"  # 연한 초록
-    )
-
-    normal_fill = PatternFill(
-        fill_type="solid",
-        fgColor="FFFFFF"  # 흰색
-    )
-
-    # risk_level 글자색 정의
     high_font = Font(color="9C0006")
     medium_font = Font(color="9C6500")
     low_font = Font(color="006100")
     normal_font = Font(color="000000")
 
     for idx, col in enumerate(df.columns, start=1):
-        # =========================
-        # 1) 컬럼 너비 자동 조정
-        # =========================
         if len(df) > 0:
             max_length = max(
                 df[col].astype(str).map(len).max(),
@@ -234,24 +209,16 @@ def adjust_excel_column_width(writer, sheet_name, df):
         column_letter = worksheet.cell(row=1, column=idx).column_letter
         worksheet.column_dimensions[column_letter].width = adjusted_width
 
-        # =========================
-        # 2) 표시 형식 적용
-        # =========================
         col_lower = str(col).lower()
 
-        # amount 컬럼: 1,000 형식
         if "amount" in col_lower:
             for cell in worksheet[column_letter][1:]:
                 cell.number_format = '#,##0'
 
-        # date 컬럼: yyyy-mm-dd 형식
         if "date" in col_lower:
             for cell in worksheet[column_letter][1:]:
                 cell.number_format = 'yyyy-mm-dd'
 
-        # =========================
-        # 3) risk_level 컬럼 색상 적용
-        # =========================
         if col_lower == "risk_level":
             for cell in worksheet[column_letter][1:]:
                 risk_value = str(cell.value).strip()
@@ -259,20 +226,379 @@ def adjust_excel_column_width(writer, sheet_name, df):
                 if risk_value == "High":
                     cell.fill = high_fill
                     cell.font = high_font
-
                 elif risk_value == "Medium":
                     cell.fill = medium_fill
                     cell.font = medium_font
-
                 elif risk_value == "Low":
                     cell.fill = low_fill
                     cell.font = low_font
-
                 else:
                     cell.fill = normal_fill
                     cell.font = normal_font
 
                 cell.alignment = Alignment(horizontal="center")
+
+
+def create_weekly_supply_view(
+    supply_plan,
+    required_by_material,
+    po_open_valid,
+    production_plan
+):
+    """
+    weekly_supply_view 시트 생성 함수
+
+    목적:
+    자재별로 12주치 생산계획, 입고계획, 과부족 계산을 가로형으로 보여준다.
+
+    구조:
+    자재 1개당 3행 생성
+    1) 생산계획
+    2) 입고계획
+    3) 과부족 계산
+
+    과부족 계산 로직:
+    첫 번째 주차:
+        첫 주차 과부족 = 첫 주차 생산계획 - 현재고 - 첫 주차 입고계획
+
+    두 번째 주차부터:
+        이번 주차 과부족 = 이전 주차 과부족 + 이번 주차 생산계획 - 이번 주차 입고계획
+
+    Excel 수식 예:
+    생산계획 행: 2행
+    입고계획 행: 3행
+    과부족 계산 행: 4행
+    current_stock: E열
+    W22: G열
+    W23: H열
+
+    첫 주차:
+        =G2-$E2-G3
+
+    두 번째 주차:
+        =G4+H2-H3
+
+    세 번째 주차:
+        =H4+I2-I3
+    """
+
+    from openpyxl.utils import get_column_letter
+
+    valid_week_dates = production_plan["week_start_date"].dropna()
+
+    if len(valid_week_dates) == 0:
+        raise ValueError(
+            "production_plan의 week_start_date가 모두 비어 있습니다. "
+            "plan_week 날짜 변환 로직을 확인하세요."
+        )
+
+    start_week_date = pd.to_datetime(valid_week_dates.min())
+
+    week_start_dates = [
+        start_week_date + pd.Timedelta(weeks=i)
+        for i in range(12)
+    ]
+
+    week_cols = [
+        f"W{week_date.isocalendar().week:02d}"
+        for week_date in week_start_dates
+    ]
+
+    required_weekly = required_by_material.copy()
+    required_weekly["week_start_date"] = pd.to_datetime(
+        required_weekly["week_start_date"],
+        errors="coerce"
+    )
+
+    required_weekly = (
+        required_weekly
+        .groupby(
+            ["material_code", "material_name", "week_start_date"],
+            as_index=False
+        )
+        .agg(production_required_qty=("required_qty", "sum"))
+    )
+
+    production_lookup = {
+        (
+            row["material_code"],
+            row["week_start_date"]
+        ): row["production_required_qty"]
+        for _, row in required_weekly.iterrows()
+    }
+
+    incoming_weekly = po_open_valid.copy()
+    incoming_weekly["eta_date"] = pd.to_datetime(
+        incoming_weekly["eta_date"],
+        errors="coerce"
+    )
+
+    incoming_weekly["eta_week_start"] = (
+        incoming_weekly["eta_date"]
+        - pd.to_timedelta(incoming_weekly["eta_date"].dt.weekday, unit="D")
+    )
+
+    incoming_weekly = (
+        incoming_weekly
+        .groupby(
+            ["material_code", "eta_week_start"],
+            as_index=False
+        )
+        .agg(incoming_qty=("open_qty", "sum"))
+    )
+
+    incoming_lookup = {
+        (
+            row["material_code"],
+            row["eta_week_start"]
+        ): row["incoming_qty"]
+        for _, row in incoming_weekly.iterrows()
+    }
+
+    material_base = (
+        supply_plan[
+            [
+                "material_code",
+                "material_name",
+                "supplier",
+                "lead_time_days",
+                "current_stock"
+            ]
+        ]
+        .drop_duplicates(subset=["material_code"])
+        .sort_values("material_code")
+        .reset_index(drop=True)
+    )
+
+    rows = []
+    shortage_events = []
+    shortage_value_lookup = {}
+
+    fixed_columns_count = 6
+    first_week_excel_col_idx = fixed_columns_count + 1
+
+    for _, material in material_base.iterrows():
+        material_code = material["material_code"]
+        material_name = material["material_name"]
+        supplier = material["supplier"]
+        lead_time_days = material["lead_time_days"]
+        current_stock = material["current_stock"]
+
+        production_excel_row = len(rows) + 2
+        incoming_excel_row = production_excel_row + 1
+        shortage_excel_row = production_excel_row + 2
+
+        production_row = {
+            "material_code": material_code,
+            "material_name": material_name,
+            "supplier": supplier,
+            "lead_time_days": lead_time_days,
+            "current_stock": current_stock,
+            "구분": "생산계획"
+        }
+
+        incoming_row = {
+            "material_code": material_code,
+            "material_name": material_name,
+            "supplier": supplier,
+            "lead_time_days": lead_time_days,
+            "current_stock": current_stock,
+            "구분": "입고계획"
+        }
+
+        shortage_row = {
+            "material_code": material_code,
+            "material_name": material_name,
+            "supplier": supplier,
+            "lead_time_days": lead_time_days,
+            "current_stock": current_stock,
+            "구분": "과부족 계산"
+        }
+
+        previous_shortage_value = None
+
+        for week_idx, week_start_date in enumerate(week_start_dates):
+            week_col = week_cols[week_idx]
+            excel_col_letter = get_column_letter(first_week_excel_col_idx + week_idx)
+
+            production_qty = production_lookup.get(
+                (material_code, week_start_date),
+                0
+            )
+
+            incoming_qty = incoming_lookup.get(
+                (material_code, week_start_date),
+                0
+            )
+
+            production_row[week_col] = production_qty
+            incoming_row[week_col] = incoming_qty
+
+            if week_idx == 0:
+                shortage_value = production_qty - current_stock - incoming_qty
+
+                shortage_formula = (
+                    f"={excel_col_letter}{production_excel_row}"
+                    f"-$E{production_excel_row}"
+                    f"-{excel_col_letter}{incoming_excel_row}"
+                )
+
+            else:
+                previous_excel_col_letter = get_column_letter(
+                    first_week_excel_col_idx + week_idx - 1
+                )
+
+                shortage_value = previous_shortage_value + production_qty - incoming_qty
+
+                shortage_formula = (
+                    f"={previous_excel_col_letter}{shortage_excel_row}"
+                    f"+{excel_col_letter}{production_excel_row}"
+                    f"-{excel_col_letter}{incoming_excel_row}"
+                )
+
+            shortage_row[week_col] = shortage_formula
+            previous_shortage_value = shortage_value
+
+            shortage_value_lookup[(material_code, week_col)] = shortage_value
+
+            if shortage_value > 0:
+                shortage_events.append({
+                    "material_code": material_code,
+                    "material_name": material_name,
+                    "supplier": supplier,
+                    "week": week_col,
+                    "week_start_date": week_start_date,
+                    "shortage_qty": shortage_value
+                })
+
+        rows.append(production_row)
+        rows.append(incoming_row)
+        rows.append(shortage_row)
+
+    weekly_supply_view = pd.DataFrame(rows)
+
+    final_columns = [
+        "material_code",
+        "material_name",
+        "supplier",
+        "lead_time_days",
+        "current_stock",
+        "구분"
+    ] + week_cols
+
+    weekly_supply_view = weekly_supply_view[final_columns]
+    shortage_events_df = pd.DataFrame(shortage_events)
+
+    return weekly_supply_view, week_cols, shortage_events_df, shortage_value_lookup
+
+
+def format_weekly_supply_view(writer, sheet_name, weekly_supply_view, week_cols):
+    """
+    weekly_supply_view 시트 전용 서식 적용 함수
+
+    적용 내용:
+    1. 첫 행 필터 적용
+    2. 첫 행 고정
+    3. 주차 컬럼 너비 조정
+    4. 숫자 천 단위 구분 표시
+    5. 구분 컬럼의 생산계획, 입고계획, 과부족 계산 행 배경색 적용
+    6. 과부족 계산 행 굵은 글씨 적용
+    7. 과부족 계산 행에서 양수 셀만 빨간 배경 조건부 서식 적용
+    8. 자재별 3행 묶음 사이에 얇은 구분선 적용
+    """
+
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+    from openpyxl.formatting.rule import CellIsRule
+    from openpyxl.utils import get_column_letter
+
+    worksheet = writer.sheets[sheet_name]
+
+    max_row = worksheet.max_row
+    max_col = worksheet.max_column
+
+    worksheet.auto_filter.ref = worksheet.dimensions
+    worksheet.freeze_panes = "A2"
+
+    production_fill = PatternFill(fill_type="solid", fgColor="DDEBF7")
+    incoming_fill = PatternFill(fill_type="solid", fgColor="E2F0D9")
+    shortage_fill = PatternFill(fill_type="solid", fgColor="FFF2CC")
+
+    shortage_positive_fill = PatternFill(fill_type="solid", fgColor="FFC7CE")
+    shortage_positive_font = Font(color="9C0006", bold=True)
+
+    header_fill = PatternFill(fill_type="solid", fgColor="D9E1F2")
+    header_font = Font(bold=True)
+
+    thin_gray_side = Side(style="thin", color="D9D9D9")
+    group_border = Border(bottom=thin_gray_side)
+
+    for cell in worksheet[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    for col_idx in range(1, max_col + 1):
+        col_letter = get_column_letter(col_idx)
+        header_value = worksheet.cell(row=1, column=col_idx).value
+
+        if header_value in week_cols:
+            worksheet.column_dimensions[col_letter].width = 12
+        elif header_value == "material_name":
+            worksheet.column_dimensions[col_letter].width = 22
+        elif header_value == "supplier":
+            worksheet.column_dimensions[col_letter].width = 16
+        elif header_value == "구분":
+            worksheet.column_dimensions[col_letter].width = 14
+        else:
+            worksheet.column_dimensions[col_letter].width = 15
+
+        if header_value in week_cols or header_value in ["lead_time_days", "current_stock"]:
+            for cell in worksheet[col_letter][1:]:
+                cell.number_format = '#,##0'
+
+    type_col_idx = list(weekly_supply_view.columns).index("구분") + 1
+    first_week_col_idx = list(weekly_supply_view.columns).index(week_cols[0]) + 1
+    last_week_col_idx = list(weekly_supply_view.columns).index(week_cols[-1]) + 1
+
+    first_week_col_letter = get_column_letter(first_week_col_idx)
+    last_week_col_letter = get_column_letter(last_week_col_idx)
+
+    for row_idx in range(2, max_row + 1):
+        row_type = worksheet.cell(row=row_idx, column=type_col_idx).value
+        type_cell = worksheet.cell(row=row_idx, column=type_col_idx)
+
+        if row_type == "생산계획":
+            type_cell.fill = production_fill
+
+        elif row_type == "입고계획":
+            type_cell.fill = incoming_fill
+
+        elif row_type == "과부족 계산":
+            type_cell.fill = shortage_fill
+
+            for col_idx in range(1, max_col + 1):
+                worksheet.cell(row=row_idx, column=col_idx).font = Font(bold=True)
+
+            shortage_range = (
+                f"{first_week_col_letter}{row_idx}:"
+                f"{last_week_col_letter}{row_idx}"
+            )
+
+            worksheet.conditional_formatting.add(
+                shortage_range,
+                CellIsRule(
+                    operator="greaterThan",
+                    formula=["0"],
+                    fill=shortage_positive_fill,
+                    font=shortage_positive_font
+                )
+            )
+
+        type_cell.alignment = Alignment(horizontal="center")
+
+        if (row_idx - 1) % 3 == 0:
+            for col_idx in range(1, max_col + 1):
+                worksheet.cell(row=row_idx, column=col_idx).border = group_border
 
 
 # =========================================================
@@ -298,7 +624,6 @@ inventory = pd.read_excel(inventory_path)
 po_open = pd.read_excel(po_open_path)
 material_master = pd.read_excel(material_master_path)
 
-# 컬럼명 공백 제거
 production_plan = clean_columns(production_plan)
 bom_master = clean_columns(bom_master)
 inventory = clean_columns(inventory)
@@ -401,7 +726,6 @@ print(
     ].drop_duplicates()
 )
 
-# 날짜 변환 실패 경고
 failed_date_count = production_plan["required_date"].isna().sum()
 
 if failed_date_count > 0:
@@ -467,7 +791,6 @@ if len(bom_missing_rows) > 0:
         ].drop_duplicates()
     )
 
-# BOM이 있는 행만 계산에 사용
 plan_bom = plan_bom[plan_bom["_merge"] == "both"].copy()
 plan_bom = plan_bom.drop(columns=["_merge"])
 
@@ -501,7 +824,6 @@ required_by_material = (
 print_df_info("자재별 주차/월별 필요수량 required_by_material", required_by_material)
 print(required_by_material.head())
 
-# 핵심 검증: 필요수량 결과가 0행이면 실패
 if len(required_by_material) == 0:
     raise ValueError(
         "자재별 필요수량 required_by_material이 0행입니다. "
@@ -512,8 +834,6 @@ if len(required_by_material) == 0:
 # =========================================================
 # 12. 월별 입고예정수량 계산
 # =========================================================
-# 기준:
-# eta_date <= 해당 plan_month의 month_end_date 인 open_qty만 incoming_qty에 포함
 
 incoming_base = required_by_material[
     ["plan_week", "plan_month", "month_end_date", "material_code"]
@@ -613,7 +933,6 @@ supply_plan = supply_plan.merge(
 
 print_df_info("수급계획 병합 결과 supply_plan", supply_plan)
 
-# 핵심 검증: 최종 병합 결과가 0행이면 실패
 if len(supply_plan) == 0:
     raise ValueError(
         "최종 supply_plan이 0행입니다. "
@@ -707,8 +1026,6 @@ print(
 # =========================================================
 # 20. 리드타임 기준 발주필요일 계산
 # =========================================================
-# 계산식:
-# order_required_date = required_date - lead_time_days
 
 supply_plan["order_required_date"] = supply_plan["required_date"] - pd.to_timedelta(
     supply_plan["lead_time_days"],
@@ -966,7 +1283,105 @@ print(summary_by_supplier.head(10))
 
 
 # =========================================================
-# 27. 최종 결과 해석 가능 여부 검증
+# 27. weekly_supply_view 시트 생성
+# =========================================================
+
+weekly_supply_view, week_cols, weekly_shortage_events, shortage_value_lookup = create_weekly_supply_view(
+    supply_plan=supply_plan,
+    required_by_material=required_by_material,
+    po_open_valid=po_open_valid,
+    production_plan=production_plan
+)
+
+print_df_info("주차별 수급 현황 weekly_supply_view", weekly_supply_view)
+print(weekly_supply_view.head(12))
+
+
+# =========================================================
+# 28. weekly_supply_view 검증
+# =========================================================
+
+weekly_validation_errors = []
+
+weekly_material_count = weekly_supply_view["material_code"].nunique()
+expected_weekly_rows = weekly_material_count * 3
+
+if len(week_cols) != 12:
+    weekly_validation_errors.append(
+        f"주차 컬럼 수가 12개가 아닙니다. 현재: {len(week_cols)}개"
+    )
+
+if len(weekly_supply_view) != expected_weekly_rows:
+    weekly_validation_errors.append(
+        f"weekly_supply_view 행 수가 자재 수 × 3과 일치하지 않습니다. "
+        f"현재 행 수: {len(weekly_supply_view)}, 예상 행 수: {expected_weekly_rows}"
+    )
+
+material_row_check = weekly_supply_view.groupby("material_code")["구분"].nunique()
+
+if not (material_row_check == 3).all():
+    weekly_validation_errors.append(
+        "일부 자재가 생산계획/입고계획/과부족 계산 3행 구조를 갖지 않습니다."
+    )
+
+required_types = {"생산계획", "입고계획", "과부족 계산"}
+actual_types = set(weekly_supply_view["구분"].unique())
+
+if actual_types != required_types:
+    weekly_validation_errors.append(
+        f"구분 컬럼 값이 예상과 다릅니다. 현재 값: {actual_types}"
+    )
+
+for material_code in weekly_supply_view["material_code"].unique():
+    material_rows = weekly_supply_view[weekly_supply_view["material_code"] == material_code]
+
+    production_row = material_rows[material_rows["구분"] == "생산계획"]
+    incoming_row = material_rows[material_rows["구분"] == "입고계획"]
+    shortage_row = material_rows[material_rows["구분"] == "과부족 계산"]
+
+    if len(production_row) != 1 or len(incoming_row) != 1 or len(shortage_row) != 1:
+        weekly_validation_errors.append(
+            f"{material_code}의 3행 구조가 올바르지 않습니다."
+        )
+        continue
+
+    current_stock = float(production_row["current_stock"].iloc[0])
+    previous_shortage = None
+
+    for week_idx, week_col in enumerate(week_cols):
+        production_qty = float(production_row[week_col].iloc[0])
+        incoming_qty = float(incoming_row[week_col].iloc[0])
+        calculated_shortage = float(shortage_value_lookup[(material_code, week_col)])
+
+        if week_idx == 0:
+            expected_shortage = production_qty - current_stock - incoming_qty
+        else:
+            expected_shortage = previous_shortage + production_qty - incoming_qty
+
+        if not np.isclose(calculated_shortage, expected_shortage):
+            weekly_validation_errors.append(
+                f"{material_code} {week_col} 과부족 계산이 맞지 않습니다. "
+                f"계산값: {calculated_shortage}, 예상값: {expected_shortage}"
+            )
+
+        previous_shortage = calculated_shortage
+
+if weekly_validation_errors:
+    print("\nweekly_supply_view 검증 실패")
+    for error in weekly_validation_errors:
+        print(f"- {error}")
+
+    raise ValueError("weekly_supply_view 검증 중 오류가 발견되었습니다.")
+
+else:
+    print("\nweekly_supply_view 검증 완료")
+    print(f"- 전체 자재 수: {weekly_material_count:,}")
+    print(f"- 전체 주차 수: {len(week_cols):,}")
+    print(f"- 전체 행 수: {len(weekly_supply_view):,}")
+
+
+# =========================================================
+# 29. 최종 결과 해석 가능 여부 검증
 # =========================================================
 
 interpretation_required_columns = [
@@ -1001,11 +1416,14 @@ check_required_columns(
 if len(supply_plan) == 0:
     raise ValueError("최종 결과가 0행입니다. 정상적인 수급계획서로 볼 수 없습니다.")
 
+if "weekly_supply_view" == "":
+    raise ValueError("weekly_supply_view 시트명이 비어 있습니다.")
+
 print("\n최종 결과 해석 가능 여부 검증 완료")
 
 
 # =========================================================
-# 28. Excel 저장
+# 30. Excel 저장
 # =========================================================
 
 with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
@@ -1027,15 +1445,28 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         index=False
     )
 
+    weekly_supply_view.to_excel(
+        writer,
+        sheet_name="weekly_supply_view",
+        index=False
+    )
+
     adjust_excel_column_width(writer, "material_supply_plan", supply_plan)
     adjust_excel_column_width(writer, "summary_by_risk", summary_by_risk)
     adjust_excel_column_width(writer, "summary_by_supplier", summary_by_supplier)
+
+    format_weekly_supply_view(
+        writer=writer,
+        sheet_name="weekly_supply_view",
+        weekly_supply_view=weekly_supply_view,
+        week_cols=week_cols
+    )
 
 print("\nExcel 저장 완료")
 
 
 # =========================================================
-# 29. 실행 후 확인용 조회 코드
+# 31. 실행 후 확인용 조회 코드
 # =========================================================
 
 print("\n결과 파일 생성 여부")
@@ -1088,7 +1519,48 @@ else:
 
 
 # =========================================================
-# 30. 완료 보고
+# 32. weekly_supply_view 부족 요약
+# =========================================================
+
+if len(weekly_shortage_events) > 0:
+    weekly_shortage_material_count = weekly_shortage_events["material_code"].nunique()
+    weekly_shortage_week_count = weekly_shortage_events["week"].nunique()
+
+    first_shortage_week = (
+        weekly_shortage_events
+        .sort_values("week_start_date")
+        .iloc[0]["week"]
+    )
+
+    max_shortage_row = (
+        weekly_shortage_events
+        .sort_values("shortage_qty", ascending=False)
+        .iloc[0]
+    )
+
+    max_shortage_material = max_shortage_row["material_code"]
+    max_shortage_qty = max_shortage_row["shortage_qty"]
+
+    print("\n부족 발생 자재/주차 요약")
+    print(
+        weekly_shortage_events
+        .sort_values(["week_start_date", "material_code"])
+        .head(20)
+    )
+
+else:
+    weekly_shortage_material_count = 0
+    weekly_shortage_week_count = 0
+    first_shortage_week = "부족 없음"
+    max_shortage_material = "부족 없음"
+    max_shortage_qty = 0
+
+    print("\n부족 발생 자재/주차 요약")
+    print("부족이 발생한 자재와 주차가 없습니다.")
+
+
+# =========================================================
+# 33. 완료 보고
 # =========================================================
 
 print("\n==============================")
@@ -1106,13 +1578,22 @@ print(f"총 과잉금액: {total_excess_amount:,.0f}")
 print(f"총 추천발주수량: {total_recommended_order_qty:,.0f}")
 print(f"총 추천발주금액: {total_recommended_order_amount:,.0f}")
 
+print("\n==============================")
+print("weekly_supply_view 생성 완료")
+print("==============================")
+print("weekly_supply_view 생성 완료 여부: True")
+print(f"전체 자재 수: {weekly_material_count:,}")
+print(f"전체 주차 수: {len(week_cols):,}")
+print(f"부족 발생 자재 수: {weekly_shortage_material_count:,}")
+print(f"부족 발생 주차 수: {weekly_shortage_week_count:,}")
+print(f"가장 먼저 부족이 발생한 주차: {first_shortage_week}")
+print(f"최대 부족수량이 발생한 자재: {max_shortage_material}")
+print(f"최대 부족수량: {max_shortage_qty:,.0f}")
+
 
 # =========================================================
-# 31. 특정 material_code 검색 예시
+# 34. 특정 material_code 검색 예시
 # =========================================================
-
-# 아래 값을 원하는 자재코드로 바꿔서 검색하면 된다.
-# 예: search_material_code = "MAT-001"
 
 search_material_code = ""
 
